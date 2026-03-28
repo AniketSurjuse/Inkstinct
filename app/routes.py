@@ -38,6 +38,40 @@ def _cancel_round_over_timer(room_id: str):
         task.cancel()
 
 
+async def _end_if_last_player(room_id: str):
+    """End an active game if only one player remains in the room."""
+    room = room_manager.get_room(room_id)
+    if not room:
+        return
+
+    if room.phase in (GamePhase.LOBBY, GamePhase.GAME_OVER):
+        return
+
+    if len(room.players) != 1:
+        return
+
+    # Stop any active timers for this room.
+    _cancel_choosing_timer(room_id)
+    _cancel_drawing_timer(room_id)
+    _cancel_round_over_timer(room_id)
+
+    room.phase = GamePhase.GAME_OVER
+    winner = room.players[0]
+
+    await manager.broadcast_all(room_id, {
+        "type": "game_over",
+        "payload": {
+            "leaderboard": [
+                {
+                    "id": winner.id,
+                    "nickname": winner.nickname,
+                    "score": winner.score,
+                }
+            ]
+        },
+    })
+
+
 async def _choosing_timer_task(room_id: str):
     """Auto-pick a random word after CHOOSING_TIME_LIMIT seconds."""
     try:
@@ -439,8 +473,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: str)
                 "type": "player_left",
                 "payload": {"playerId": player_id},
             })
-            # If no players left, clean up timers
-            if not room.players:
-                _cancel_choosing_timer(room_id)
-                _cancel_drawing_timer(room_id)
-                _cancel_round_over_timer(room_id)
+            # If game is active and one player remains, end game and declare winner.
+            await _end_if_last_player(room_id)
+        else:
+            # Room removed (last player left) — ensure timers are cleaned up.
+            _cancel_choosing_timer(room_id)
+            _cancel_drawing_timer(room_id)
+            _cancel_round_over_timer(room_id)
