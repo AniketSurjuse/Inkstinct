@@ -314,11 +314,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: str)
             payload = data.get("payload", {})
 
             if msg_type == "draw":
-                game_engine.add_stroke(room_id, payload)
-                await manager.broadcast(room_id, {
-                    "type": "draw",
-                    "payload": payload,
-                }, exclude=player_id)
+                is_preview = payload.get("_preview") is True
+                if is_preview:
+                    await manager.broadcast(room_id, {
+                        "type": "draw",
+                        "payload": {**payload, "playerId": player_id},
+                    }, exclude=player_id)
+                else:
+                    game_engine.add_stroke(room_id, payload)
+                    await manager.broadcast(room_id, {
+                        "type": "draw",
+                        "payload": {**payload, "playerId": player_id},
+                    }, exclude=player_id)
 
             elif msg_type == "clear_canvas":
                 game_engine.clear_strokes(room_id)
