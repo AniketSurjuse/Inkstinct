@@ -7,6 +7,9 @@ from .words import get_random_words
 from . import rooms as room_manager
 
 
+PERFECT_ROUND_DRAWER_BONUS = 25
+
+
 def _levenshtein_distance(s1: str, s2: str) -> int:
     """Compute edit distance between two strings."""
     if len(s1) < len(s2):
@@ -75,26 +78,26 @@ def check_guess(room_id: str, player_id: str, text: str) -> tuple[bool, int, boo
     answer = room.current_word.lower()
 
     if guess == answer:
-        # Time-dependent scoring
-        total_time = room.settings.draw_time
-        elapsed = total_time - room.time_left
-        time_ratio = max(0, room.time_left / total_time) if total_time > 0 else 0
+        # Guesser score: round((500 * (t / s)) * rank_multiplier)
+        total_time = max(1, room.settings.draw_time)
+        time_ratio = max(0.0, min(1.0, room.time_left / total_time))
 
-        # Base points: 50-150 based on time remaining (more time left = more points)
-        base_points = int(50 + 100 * time_ratio)
-
-        # Order bonus
-        guessed_count = sum(1 for p in room.players if p.has_guessed)
-        order_bonus = max(0, 30 - guessed_count * 10)
-
-        points = base_points + order_bonus
+        guessed_before = sum(
+            1
+            for i, p in enumerate(room.players)
+            if i != room.current_drawer_index and p.has_guessed
+        )
+        rank = guessed_before + 1
+        rank_multiplier = max(0.5, 1.0 - (0.1 * (rank - 1)))
+        points = round((500 * time_ratio) * rank_multiplier)
 
         player.has_guessed = True
         player.score += points
 
-        # Drawer bonus: proportional to time (faster guesses = more drawer reward)
-        drawer_bonus = int(10 + 15 * time_ratio)
-        drawer.score += drawer_bonus
+        # Drawer score increment: (guesser_points / (n-1)) * 0.5
+        possible_guessers = max(1, len(room.players) - 1)
+        drawer_increment = round((points / possible_guessers) * 0.5)
+        drawer.score += drawer_increment
 
         return True, points, False
 
@@ -107,6 +110,42 @@ def check_guess(room_id: str, player_id: str, text: str) -> tuple[bool, int, boo
     return False, 0, False
 
 
+def _effective_hint_count(room: Room) -> int:
+    """Return effective hint count after applying short-word guardrails."""
+    if not room.current_word:
+        return 0
+
+    revealable_len = sum(1 for ch in room.current_word if ch != " ")
+    max_hints_by_length = max(0, (revealable_len // 2) - 1)
+    return min(room.settings.hints_count, max_hints_by_length)
+
+
+def _hint_trigger_times(room: Room) -> list[float]:
+    """Build elapsed-time thresholds matching requested skribbl-like timing.
+
+    Targets:
+    - 1 hint: 50%
+    - 2 hints: 40%, 70%
+    - 3+ hints: evenly spaced with last at 70%
+      (e.g. 3 => 50,60,70 | 4 => 47.5,55,62.5,70)
+    """
+    effective_hints = _effective_hint_count(room)
+    if effective_hints <= 0:
+        return []
+
+    total = float(max(1, room.settings.draw_time))
+
+    if effective_hints == 1:
+        return [total * 0.5]
+
+    if effective_hints == 2:
+        return [total * 0.4, total * 0.7]
+
+    # For 3+ hints, use spacing of 30% / h and anchor the last hint at 70%.
+    step = total * (0.3 / effective_hints)
+    return [total * 0.7 - step * i for i in range(effective_hints - 1, -1, -1)]
+
+
 def get_word_hint(room: Room, force_hint_number: int | None = None) -> str:
     """Generate a hint string. If force_hint_number is given, reveal that many hints worth of letters."""
     if not room.current_word:
@@ -117,16 +156,17 @@ def get_word_hint(room: Room, force_hint_number: int | None = None) -> str:
         if ch == " ":
             hint[i] = " "
 
-    # Determine how many letters to reveal based on hint number
+    # Determine how many hints can be used and clamp requested hint number.
     hints_to_use = force_hint_number if force_hint_number is not None else room.hints_given
-    if hints_to_use <= 0:
+    effective_hints = _effective_hint_count(room)
+    hints_to_use = min(hints_to_use, effective_hints)
+    if hints_to_use <= 0 or effective_hints <= 0:
         return " ".join(hint)
 
-    # Reveal letters: each hint reveals ~20-25% of non-space chars
+    # Reveal exactly one new letter per hint, deterministically per room+word.
     indices = [i for i, ch in enumerate(room.current_word) if ch != " "]
     total_revealable = len(indices)
-    letters_per_hint = max(1, total_revealable // (room.settings.hints_count + 1))
-    reveal_count = min(total_revealable, letters_per_hint * hints_to_use)
+    reveal_count = min(total_revealable, hints_to_use)
 
     random.seed(room.id + room.current_word)  # Deterministic
     random.shuffle(indices)
@@ -140,12 +180,13 @@ def should_give_hint(room: Room) -> bool:
     """Check if it's time to give a new hint based on elapsed time."""
     if not room.drawing_started_at or not room.current_word:
         return False
-    if room.hints_given >= room.settings.hints_count:
+
+    effective_hints = _effective_hint_count(room)
+    if room.hints_given >= effective_hints:
         return False
 
     elapsed = time.time() - room.drawing_started_at
-    # First hint at 30s, subsequent hints every 20s after that
-    hint_times = [30 + i * 20 for i in range(room.settings.hints_count)]
+    hint_times = _hint_trigger_times(room)
 
     if room.hints_given < len(hint_times) and elapsed >= hint_times[room.hints_given]:
         return True
@@ -157,9 +198,25 @@ def give_hint(room_id: str) -> Optional[tuple[Room, str]]:
     room = room_manager.get_room(room_id)
     if not room or room.phase != GamePhase.DRAWING:
         return None
+
+    effective_hints = _effective_hint_count(room)
+    if room.hints_given >= effective_hints:
+        return None
+
     room.hints_given += 1
     hint = get_word_hint(room)
     return room, hint
+
+
+def apply_perfect_round_bonus(room_id: str) -> int:
+    """Award a small bonus to the drawer when everyone guesses before timeout."""
+    room = room_manager.get_room(room_id)
+    if not room or room.phase != GamePhase.DRAWING or not room.players:
+        return 0
+
+    drawer = room.players[room.current_drawer_index]
+    drawer.score += PERFECT_ROUND_DRAWER_BONUS
+    return PERFECT_ROUND_DRAWER_BONUS
 
 
 def end_round(room_id: str) -> Optional[Room]:
