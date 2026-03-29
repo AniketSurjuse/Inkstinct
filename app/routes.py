@@ -359,6 +359,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: str)
                         ]
                         if all(p.has_guessed for p in non_drawer):
                             _cancel_drawing_timer(room_id)
+                            game_engine.apply_perfect_round_bonus(room_id)
                             room = game_engine.end_round(room_id)
                             if room:
                                 await manager.broadcast_all(room_id, {
